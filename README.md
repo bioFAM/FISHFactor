@@ -1,5 +1,5 @@
 # FISHFactor: A Probabilistic Factor Model for Spatial Transcriptomics Data with Subcellular Resolution
-Code repository supplementing the eponymous paper.
+Code repository supplementing the [eponymous paper](https://www.biorxiv.org/content/10.1101/2021.11.04.467354v1)
 
 FISHFactor is a non-negative, spatially informed factor analysis model with a Poisson point process likelihood to model single-molecule resolved data, as for example obtained from multiplexed fluorescence in-situ hybridization methods. In addition, FISHFactor allows to integrate multiple data groups (e.g. cells) by jointly inferring group-specific factors and a weight matrix that is shared across groups. The model is implemented with the deep probabilistic programming language [Pyro](https://pyro.ai/) and the Gaussian process package [GPyTorch](https://gpytorch.ai/).
 
