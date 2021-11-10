@@ -6,7 +6,7 @@ import numpy as np
 import pyro
 import gpytorch
 import time
-import utils
+from src import utils
 
 
 class BatchGP(gpytorch.models.ApproximateGP):
@@ -329,7 +329,7 @@ class FISHFactor(gpytorch.Module):
         max_epochs: int=10000,
         patience: int=1000,
         delta: float=0.01,
-        save_every: typing.optional[int]=None,
+        save_every: typing.Optional[int]=None,
         save_dir: typing.Optional[str]=None,
         max_points: int=5000,
         ):
