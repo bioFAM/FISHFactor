@@ -12,8 +12,8 @@ FISHFactor is a non-negative, spatially informed factor analysis model with a Po
 - **exp_subsample/** (*in preparation*) contains data subsampling experiments on NIH/3T3 cells from the seqFISH+ paper (section 4.2 in the paper).
 - **exp_multicell/** (*in preparation*) contains experiments with multiple NIH/3T3 cells (section 4.2 in the paper).
 - **exp_scalability/** (*in preparation*) contains scalability experiments on NIH/3T3 cells (section 4.2 in the paper).
-- **data/** (*in preparation*) contains scripts to download and process seqFISH+ data as well as scripts to simulate data.
+- **data/** contains scripts to download and process seqFISH+ data as well as scripts to simulate data.
 
 ## Usage
 
-*in preparation*
+An example for using FISHFactor with 15 NIH/3T3 cells is shown in *example.py*.
