@@ -332,6 +332,7 @@ class FISHFactor(gpytorch.Module):
         save_every: typing.Optional[int]=None,
         save_dir: typing.Optional[str]=None,
         max_points: int=5000,
+        print_every: int=100,
         ):
         """Do inference.
 
@@ -346,6 +347,7 @@ class FISHFactor(gpytorch.Module):
         :param save_dir: directory where intermediate states are saved
         :param max_points: maximum number of data points to use, otherwise
             do subsampling to use less memory
+        :param print_every: number of epochs after which loss is printed
         """
         self.lr = lr
         self.lrd = lrd
@@ -413,10 +415,11 @@ class FISHFactor(gpytorch.Module):
                 self.zero_grad()
                 loss.append(svi.step(self.data_tensor, subsample_inds))
 
-            print(
-                'epoch: %s, loss: %s, min loss: %s, patience: %s'
-                %(epoch, round(loss[-1], 4), min_loss, patience - wait_epochs)
-            )
+            if epoch % print_every == 0:
+                print(
+                    'epoch: %s, loss: %s, min loss: %s, patience: %s'
+                    %(epoch, round(loss[-1], 4), min_loss, patience - wait_epochs)
+                )
 
             # early stopping
             if (loss[-1] <= (min_loss[self.m_inds[-1]] - delta)) & (epoch > 10):
