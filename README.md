@@ -16,4 +16,4 @@ FISHFactor is a non-negative, spatially informed factor analysis model with a Po
 
 ## Usage
 
-An example for using FISHFactor with 15 NIH/3T3 cells is shown in *example.py*.
+An example for using FISHFactor with 15 NIH/3T3 cells is shown in *example.ipynb*.
