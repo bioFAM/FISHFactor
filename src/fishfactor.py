@@ -418,7 +418,7 @@ class FISHFactor(gpytorch.Module):
             if epoch % print_every == 0:
                 print(
                     'epoch: %s, loss: %s, min loss: %s, patience: %s'
-                    %(epoch, round(loss[-1], 4), min_loss, patience - wait_epochs)
+                    %(epoch, round(loss[-1], 4), min_loss.tolist(), patience - wait_epochs)
                 )
 
             # early stopping
