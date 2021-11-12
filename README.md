@@ -8,9 +8,9 @@ FISHFactor is a non-negative, spatially informed factor analysis model with a Po
 
 ## Repository structure
 - **src/** contains the FISHFactor model, data simulation and util functions.
-- **exp_sim/** (*in preparation*) contains experiments on simulated data (section 4.1 in paper).
-- **exp_subsample/** (*in preparation*) contains data subsampling experiments on NIH/3T3 cells from the seqFISH+ paper (section 4.2 in the paper).
-- **exp_multicell/** (*in preparation*) contains experiments with multiple NIH/3T3 cells (section 4.2 in the paper).
+- **exp_sim/** contains experiments on simulated data (section 4.1 in paper).
+- **exp_subsample/** contains data subsampling experiments on NIH/3T3 cells from the seqFISH+ paper (section 4.2 in the paper).
+- **exp_multicell/** contains experiments with multiple NIH/3T3 cells (section 4.2 in the paper).
 - **data/** contains scripts to download and process seqFISH+ data as well as scripts to simulate data.
 
 ## Usage
