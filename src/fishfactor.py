@@ -1,304 +1,205 @@
-import typing
 import os
 import torch
-import pandas as pd
-import numpy as np
+import time
 import pyro
 import gpytorch
-import time
-from src import utils
-
-
-class BatchGP(gpytorch.models.ApproximateGP):
-    def __init__(
-        self,
-        inducing_points: torch.tensor,
-        nu: float=1.5,
-        use_scale_factor=True,
-        ):
-        """Batch svGP in 2D with Matérn kernel.
-        
-        :param inducing_points: tensor of shape (batch_size, n_inducing, 2) with
-            initial inducing coordinates (determines batch size)
-        :param nu: smoothness parameter of Matérn kernel, can be 0.5, 1.5, 2.5
-        """
-        batch_shape = inducing_points.shape[0]
-
-        variational_distribution = (
-            gpytorch.variational.CholeskyVariationalDistribution(
-            num_inducing_points=inducing_points.shape[1],
-            batch_shape=torch.Size([batch_shape]),
-            )
-        )
-
-        variational_strategy = gpytorch.variational.VariationalStrategy(
-            model=self,
-            inducing_points=inducing_points,
-            variational_distribution=variational_distribution,
-        )
-
-        super().__init__(variational_strategy=variational_strategy)
-
-        self.mean_module = gpytorch.means.ZeroMean(
-            batch_shape=torch.Size([batch_shape]),
-        )
-
-        if use_scale_factor:
-            base_covar_module = gpytorch.kernels.MaternKernel(
-                batch_shape=torch.Size([batch_shape]),
-                nu=nu,
-            )
-
-            self.covar_module = gpytorch.kernels.ScaleKernel(
-                base_covar_module,
-                batch_shape=torch.Size([batch_shape])
-            )
-        else:
-            self.covar_module = gpytorch.kernels.MaternKernel(
-                batch_shape=torch.Size([batch_shape]),
-                nu=nu,
-            )
-
-    def forward(self, x):
-        mean = self.mean_module(x)
-        covar = self.covar_module(x)
-        return gpytorch.distributions.MultivariateNormal(mean, covar)
+import json
+import pickle
+import pandas as pd
+import numpy as np
+from src import utils, gp
 
 
 class FISHFactor(gpytorch.Module):
     def __init__(
         self,
         data: pd.DataFrame,
-        n_latents: int,
-        nu: float=1.5,
-        n_inducing: int=50,
-        grid_resolution: int=50,
-        min_density: float=0.1,
-        masks: typing.Optional[torch.tensor]=None,
-        normalize_coordinates: bool=True,
+        n_factors: int,
         device: str='cpu',
-        ):
-        """FISHFactor model.
+        n_inducing: int=100,
+        grid_res: int=50,
+        factor_smoothness: float=1.5,
+        masks_threshold: float=0.4,
+        init_bin_res: int=5,
+        ) -> None:
+        """FISHFactor model
         
-        :param data: DataFrame with columns 'x', 'y', 'feature', 'group'
-        :param n_latents: number of latent processes per group
-        :param nu: smoothness parameter of Matérn kernel
-        :param n_inducing: number of inducing points per latent process
-        :param grid_resolution: resolution per spatial dimension of a discrete
-            grid that is used e.g. to compute quadrature values in the 
-            likelihood integral and to create a binary mask of the cell
-        :param min_density: minimum value of the kernel density estimate of
-            points in every group to be included in the group mask
-        :param masks: replaces masks created by density estimate, if specified
-        :param normalize_coordinates: if True, rescale points of every
-            group to the unit square
-        :param device: 'cpu' or 'cuda:x'
+        Args:
+            data: DataFrame with 'x', 'y', 'cell', 'gene' columns
+            n_factors: number of spatial factors per cell
+            device: 'cpu' or 'cuda:x'
+            n_inducing: number of GP inducing points per spatial factor
+            grid_res: grid resolution, for cell masks and integral quadrature
+            factor_smoothness: smoothness parameter of Matérn kernel
+                (0.5, 1.5, or 2.5)
+            masks_threshold: KDE threshold for cell masks
+            init_bin_res: weight initialization resolution (binning based NMF)
         """
         super().__init__()
+        pyro.clear_param_store()
 
-        self.K = n_latents
-        self.n_inducing = n_inducing
-        self.grid_resolution = grid_resolution
+        self.data = data
+        self.n_factors = n_factors
         self.device = device
-        self.nu = nu
-        self.min_density = min_density
+        self.n_inducing = n_inducing
+        self.grid_res = grid_res
+        self.factor_smoothness = factor_smoothness
+        self.masks_threshold = masks_threshold
+        self.init_bin_res = init_bin_res
 
-        # enumerate features
-        data['feature_id'], self.features = pd.factorize(data['feature'])
-        self.D = len(self.features) # number of features
+        self.to(device=self.device)
 
-        # enumerate groups
-        data['group_id'], self.groups = pd.factorize(data['group'])
-        self.M = len(self.groups) # number of groups
+        # indexing of genes
+        self.data['gene_id'], self.genes = pd.factorize(data['gene'])
+        self.n_genes = len(self.genes)
 
-        # number of data points per group
-        self.N_m = torch.tensor(data.groupby('group_id').size())
+        # indexing of cells
+        data['cell_id'], self.cells = pd.factorize(data['cell'])
+        self.n_cells = len(self.cells)
+        
+        # coordinate rescaling of every cell to the unit square
+        self.data = utils.rescale_cells(self.data)
 
-        self.data_tensor = torch.tensor(
-            data=data[['x', 'y', 'feature_id', 'group_id']].values,
-            dtype=torch.float32,
-            device=self.device
-        )
+        self.data = self.data.sort_values(by='gene_id')
 
-        # group-wise rescaling of coordinates to unit square
-        if normalize_coordinates:
-            self.data_tensor = utils.normalize_group_coordinates(
-                self.data_tensor)
+        # grid coordinates in unit square
+        self.grid = utils.grid(self.grid_res).to(device=self.device)
 
-        # regularly spaced grid in unit square
-        grid = utils.grid(grid_resolution)
-        self.grid = grid.to(dtype=torch.float32, device=self.device)
+        # cell masks based on KDE threshold
+        self.masks = utils.cell_masks(
+            data=self.data,
+            grid=self.grid.cpu(),
+            threshold=self.masks_threshold,
+            ).to(device=self.device)
 
-        # mask for every group, based on threshold on kernel density estimate
-        # of data points in the group
-        if masks == None:
-            masks = []
-            for group in self.data_tensor[:, 3].unique():
-                masks.append(
-                    utils.density_mask(
-                        data=self.data_tensor[self.data_tensor[:, 3]==group],
-                        grid=self.grid,
-                        min_density=min_density,
+        # initialization of weights with binning based NMF
+        self.w_init = utils.initialize_weights(
+            data=self.data,
+            n_factors=self.n_factors,
+            bin_res=self.init_bin_res,
+            ).to(device=self.device).detach()
+        self.q_init = (self.w_init.exp() - 1).log().clamp(min=-10)
+
+        self.scaling = utils.average_intensity(
+            data=self.data,
+            masks=self.masks.cpu(),
+            per_gene=True,
+            per_cell=True,
+        ).to(device=self.device)
+
+        # instantiate spatial factors
+        self.factor_list = []
+        for cell_id in range(self.n_cells):
+            # sample initial inducing point locations from molecule locations
+            cell_data = self.data[self.data.cell_id==cell_id]
+            inducing_points = cell_data.sample(
+                n=min(n_inducing, len(cell_data))
                 )
-            )
-            self.masks = torch.stack(masks, dim=0).to(device=self.device)
-        else:
-            self.masks = masks.to(device=self.device)
 
-        # average intensity per feature and group, given by number of points
-        # divided by group mask area
-        cell_area = self.masks.sum(dim=[-1, -2]) / self.grid_resolution**2
-        n_points = data.groupby(['feature_id', 'group_id']).size().reset_index()
-        table = n_points.pivot('group_id', 'feature_id', 0).fillna(0).values.T
-        mean_intensity = torch.tensor(table) / cell_area.view(1, self.M).cpu()
-        self.mean_intensity = mean_intensity.to(
-            dtype=torch.float32,
-            device=self.device
-        )
-
-        # keep track of the groups that were subsampled
-        self.m_inds = []
-
-        # instantiate one batch gp per group
-        if self.M == 1:
-            use_scale_factor = False
-        else:
-            use_scale_factor = True
-
-        self.gp_list = []            
-        for m in range(self.M):
-            # choose random data points as initial inducing locations
-            group_inds = (self.data_tensor[:, 3] == m).cpu()
-            inducing_points = torch.zeros([self.K, n_inducing, 2])
-            for k in range(self.K):
-                random_inds = np.random.choice(
-                    a=group_inds.nonzero().flatten(),
-                    size=[n_inducing]
-                )
-                random_points = self.data_tensor[random_inds].clone().detach()
-                inducing_points[k] = random_points[:, [0, 1]]
-
-            self.gp_list.append(BatchGP(
+            self.factor_list.append(gp.SpatialFactors(
                 inducing_points=inducing_points,
-                nu=nu,
-                use_scale_factor=use_scale_factor,
+                n_factors=n_factors,
+                smoothness=factor_smoothness,
+                scale_param=self.n_cells > 1,
             ).to(device=self.device))
-            
+
     def model(
         self,
-        x: torch.tensor,
-        subsample_inds: typing.Sequence
-        ):
+        data: torch.tensor,
+        cell: int,
+        ) -> None:
         """Pyro model.
         
-        :param x: tensor of shape (N, 4) with x coordinate in first, y
-            coordinate in second, numeric feature value in third and numeric
-            group value in fourth column.
-        :param subsample_inds: list of index tensors for data points in every
-            group, can be subsampled or not.
+        Args:
+            data: tensor of shape (N, 3) with x, y, gene_id columns
+            cell: id of selected cell (only one at a time)
         """
-        for m in range(self.M):
-            pyro.module('gp_%s' %m, self.gp_list[m])
-        
-        N_plate = pyro.plate('N_plate', dim=-1, device=self.device)
-        K_plate = pyro.plate('K_plate', dim=-2, device=self.device, size=self.K)
-        M_plate = pyro.plate('M_plate', dim=-3, device=self.device, size=self.M)
-        D_plate = pyro.plate('D_plate', dim=-4, device=self.device, size=self.D)
+        # register GPs in Pyro
+        pyro.module('factors_%s' %cell, self.factor_list[cell])
+
+        data_plate = pyro.plate('data_plate', dim=-1, device=self.device)
+        factor_plate = pyro.plate('factor_plate', dim=-2, device=self.device,
+            size=self.n_factors)
+        gene_plate = pyro.plate('gene_plate', dim=-3, device=self.device,
+            size=self.n_genes)
 
         # weights
-        with D_plate, K_plate:
-            w = pyro.sample(
-                name='w',
+        with gene_plate, factor_plate:
+            q = pyro.sample(
+                name='q',
                 fn=pyro.distributions.Normal(
-                    loc=torch.tensor(
-                        data=0.,
-                        dtype=torch.float32,
-                        device=self.device
-                    ),
-                    scale=torch.tensor(
-                        data=1.,
-                        dtype=torch.float32,
-                        device=self.device
-                    ),
+                    loc=torch.tensor(0, dtype=torch.float32,
+                        device=self.device),
+                    scale=torch.tensor(1., dtype=torch.float32,
+                        device=self.device),
                 ),
-            ).view(-1, self.D, 1, self.K, 1)
-        w = torch.nn.Softplus()(w)
+            ).view(-1, self.n_genes, self.n_factors, 1)
+        w = torch.nn.Softplus()(q)
 
         # factors
-        with M_plate as m_ind, K_plate, N_plate:
-            group_data = x[x[:, 3]==m_ind[0]]
-            subsampled_data = group_data[subsample_inds[m_ind[0]].bool()]
-            eval_points = torch.cat([subsampled_data[:, [0, 1]], self.grid])
-            z = pyro.sample(
-                name='z',
-                fn=self.gp_list[m_ind[0]].pyro_model(eval_points),
-            ).view(-1, 1, 1, self.K, eval_points.shape[0])
-        z = torch.nn.Softplus()(z)
+        cell_grid = self.grid[self.masks[cell].flatten()]
+        eval_points = torch.cat([data[:, [0, 1]], cell_grid])
+        with factor_plate, data_plate:
+            f = pyro.sample(
+                name='f',
+                fn=self.factor_list[cell].pyro_model(eval_points),
+            ).view(-1, 1, self.n_factors, eval_points.shape[0])
+        z = torch.nn.Softplus()(f)
 
         # intensity function
         intensity = torch.matmul(
-            input=w.transpose(-1, -2),
-            other=z
-        ).view(-1, self.D, 1, 1, eval_points.shape[0])
+            input=w.squeeze(-1),
+            other=z.squeeze(-3),
+        ).view(-1, self.n_genes, 1, eval_points.shape[0])
 
-        # scale intensity function with average intensity per feature in the
-        # subsampled group and with the data subsampling fraction p to get an
-        # estimate on the correct scale
-        group_mean_intensity = self.mean_intensity[:, m_ind[0]]
-        group_mean_intensity = group_mean_intensity.view(1, self.D, 1, 1, 1)
-        intensity = intensity * group_mean_intensity * self.p[m_ind[0]]
+        intensity *= self.scaling[:, cell].view(1, self.n_genes, 1, 1)
 
         # intensity values at data and quadrature points
         data_intensity, quadrature_intensity = intensity.split(
-            split_size=[subsampled_data.shape[0], self.grid.shape[0]],
+            split_size=[data.shape[0], cell_grid.shape[0]],
             dim=-1,
         )
 
-        # set quadrature intensity values at background points to zero
-        group_mask = self.masks[m_ind[0]].view(1, 1, 1, 1, self.grid.shape[0])
-        masked_quadrature_intensity = quadrature_intensity * group_mask
-        
+
         # Poisson point process likelihood
         expectation = (
-            masked_quadrature_intensity.sum(dim=-1) / group_mask.sum()
-        ).sum(dim=[1, 2, 3])
+            quadrature_intensity.sum(dim=-1) / self.masks[cell].sum()
+        ).sum(dim=[1, 2,])
 
         point_log_intensity = (
-            (data_intensity[:, subsampled_data[:, 2].long(), 0, 0,
-                torch.arange(subsampled_data.shape[0])]).log().sum(dim=-1))
+            (data_intensity[:, data[:, 2].long(), 0,
+                torch.arange(data.shape[0])]).log().sum(dim=-1))
 
         pyro.factor('log_likelihood', point_log_intensity - expectation)
 
     def guide(
         self,
-        x: torch.tensor,
-        subsample_inds: typing.Sequence,
-        ):
+        data: torch.tensor,
+        cell: int,
+        ) -> None:
         """Pyro guide.
         
-        for parameters see model.
+        Args:
+            data: tensor of shape (N, 3) with x, y, gene_id columns
+            cell: id of selected cell (only one at a time)
         """
-        N_plate = pyro.plate('N_plate', dim=-1, device=self.device)
-        K_plate = pyro.plate('K_plate', dim=-2, device=self.device, size=self.K)
-        M_plate = pyro.plate('M_plate', dim=-3, device=self.device, size=self.M,
-            subsample_size=1)
-        D_plate = pyro.plate('D_plate', dim=-4, device=self.device, size=self.D)
+        data_plate = pyro.plate('data_plate', dim=-1, device=self.device)
+        factor_plate = pyro.plate('factor_plate', dim=-2, device=self.device,
+            size=self.n_factors)
+        gene_plate = pyro.plate('gene_plate', dim=-3, device=self.device,
+            size=self.n_genes)
 
         # weights
-        w_loc_raw = pyro.param(
-            name='w_loc_raw',
-            init_tensor=torch.full(
-                size=[self.D, 1, self.K, 1],
-                fill_value=0.0,
-                dtype=torch.float32,
-                device=self.device
-            ),
+        q_loc = pyro.param(
+            name='q_loc',
+            init_tensor=(self.q_init
+                .view(self.n_genes, self.n_factors, 1).clone())
         )
 
-        w_scale_raw = pyro.param(
-            name='w_scale_raw',
+        q_scale = pyro.param(
+            name='q_scale',
             init_tensor=torch.full(
-                size=[self.D, 1, self.K, 1],
+                size=[self.n_genes, self.n_factors, 1],
                 fill_value=1.0,
                 dtype=torch.float32,
                 device=self.device
@@ -306,65 +207,53 @@ class FISHFactor(gpytorch.Module):
             constraint=pyro.distributions.constraints.positive,
         )
 
-        with D_plate, K_plate:
+        with gene_plate, factor_plate:
             pyro.sample(
-                name='w',
-                fn=pyro.distributions.Normal(w_loc_raw, w_scale_raw),
+                name='q',
+                fn=pyro.distributions.Normal(q_loc, q_scale),
                 infer=dict(baseline={'use_decaying_avg_baseline' : True}),
             )
 
         # factors
-        with M_plate as m_ind, K_plate, N_plate:
-            self.m_inds.append(m_ind[0])
-            group_data = x[x[:, 3]==m_ind[0]]
-            subsampled_data = group_data[subsample_inds[m_ind[0]].bool()]
-            eval_points = torch.cat([subsampled_data[:, [0, 1]], self.grid])
-            pyro.sample('z', self.gp_list[m_ind[0]].pyro_guide(eval_points))
+        with factor_plate, data_plate:
+            cell_grid = self.grid[self.masks[cell].flatten()]
+            eval_points = torch.cat([data[:, [0, 1]], cell_grid])
+            pyro.sample('f', self.factor_list[cell].pyro_guide(eval_points))
 
     def inference(
         self,
         lr: float=5e-3,
         lrd: float=1.,
         n_particles: int=15,
+        early_stopping_patience: int=100,
+        min_improvement: float=0.01,
         max_epochs: int=10000,
-        patience: int=1000,
-        delta: float=0.01,
-        save_every: typing.Optional[int]=None,
-        save_dir: typing.Optional[str]=None,
-        max_points: int=5000,
-        print_every: int=100,
+        save: bool=True,
+        save_every: int=100,
+        save_dir: str='results/'
         ):
-        """Do inference.
-
-        :param lr: initial learning rate
-        :param lrd: learning rate decrease factor
-        :param n_particles: number of samples to use for ELBO gradient estimate
-        :param max_epochs: maximum number of epochs before training terminates
-        :param patience: number of epochs without relevant loss improvement
-            before training is stopped
-        :param delta: minimum absolute loss decrease to count as improvement
-        :param save_every: number of epochs after which model state is saved
-        :param save_dir: directory where intermediate states are saved
-        :param max_points: maximum number of data points to use, otherwise
-            do subsampling to use less memory
-        :param print_every: number of epochs after which loss is printed
+        """Perform stochastic variational inference.
+        
+        Args:
+            lr: adam learning rate
+            lrd: learning rate decrease factor
+            n_particles: number of samples for ELBO gradient estimate
+            early_stopping_patience: number of epochs without improvement
+                before training terminates
+            min_improvement: minimum absolute ELBO increase to
+                be considered an improvement
+            max_epochs: maximum number of epochs before training terminates
+            save: whether the model is saved
+            save_every: number of epochs after which model is saved
+            save_dir: where the model is saved
         """
-        self.lr = lr
-        self.lrd = lrd
-        self.n_particles = n_particles
-        self.max_epochs = max_epochs
-        self.patience = patience
-        self.delta = delta
-        self.save_every = save_every
-        self.save_dir = save_dir
-        self.max_points = max_points
+        data_tensor = torch.tensor(
+            data=self.data[['x', 'y', 'gene_id', 'cell_id']].values,
+            dtype=torch.float32,
+            device=self.device,
+        ).detach()
 
-        # make directory to save results, if it does not exist yet
-        if save_dir != None:
-            if not os.path.isdir(save_dir):
-                os.makedirs(save_dir)
-
-        optimizer = pyro.optim.ClippedAdam({'lr' : lr, 'lrd' : lrd})
+        self.optimizer = pyro.optim.ClippedAdam({'lr' : lr, 'lrd' : lrd})
 
         elbo = pyro.infer.Trace_ELBO(
             retain_graph=True,
@@ -375,26 +264,27 @@ class FISHFactor(gpytorch.Module):
         svi = pyro.infer.SVI(
             model=self.model,
             guide=self.guide,
-            optim=optimizer,
-            loss=elbo
+            optim=self.optimizer,
+            loss=elbo,
         )
 
         self.train()
 
-        self.p = torch.clamp(max_points / self.N_m, max=1.)
+        self.init_losses = torch.zeros([self.n_cells])
+        self.min_losses = torch.zeros([self.n_cells])
+        for cell in range(self.n_cells):
+            cell_data = data_tensor[data_tensor[:, 3]==cell]
+            init_loss = svi.evaluate_loss(cell_data[:, :3], cell)
+            self.init_losses[cell] = init_loss
+            with pyro.poutine.scale(scale=1./abs(init_loss)):
+                min_loss = svi.evaluate_loss(cell_data[:, :3], cell)
+                self.min_losses[cell] = min_loss
 
-        subsample_inds = []
-        for m in range(self.M):
-            subsample_inds.append(
-                torch.bernoulli(
-                    torch.full(size=[self.N_m[m]], fill_value=self.p[m])
-                )
-            )
-        init_loss = svi.evaluate_loss(self.data_tensor, subsample_inds)
-        min_loss = torch.full([self.M], 1e5)
         wait_epochs = 0
-        loss = []
+        self.losses = [[] for i in range(self.n_cells)]
+        self.memory_stats = [[] for i in range(self.n_cells)]
 
+        # start timer
         if self.device.startswith('cuda'):
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
@@ -404,73 +294,172 @@ class FISHFactor(gpytorch.Module):
 
         # optimization loop
         for epoch in range(max_epochs):
-            subsample_inds = []
-            for m in range(self.M):
-                subsample_inds.append(
-                    torch.bernoulli(
-                        torch.full(size=[self.N_m[m]], fill_value=self.p[m])
-                    )
-                )
-            with pyro.poutine.scale(scale=1.0 / abs(init_loss)):
-                self.zero_grad()
-                loss.append(svi.step(self.data_tensor, subsample_inds))
+            improvements = torch.zeros([self.n_cells])
+        
+            for cell in range(self.n_cells):
+                cell_data = data_tensor[data_tensor[:, 3]==cell]
 
-            if epoch % print_every == 0:
+                with pyro.poutine.scale(scale=1./abs(self.init_losses[cell])):
+                    self.zero_grad()
+                    loss = svi.step(cell_data[:, :3], cell)
+                self.losses[cell].append(loss)
+                improvements[cell] = self.min_losses[cell] - loss
+
                 print(
-                    'epoch: %s, loss: %s, min loss: %s, patience: %s'
-                    %(epoch, round(loss[-1], 4), min_loss.tolist(), patience - wait_epochs)
+                    'epoch: %s, cell: %s, improvement: %s, patience: %s'
+                    %(epoch, cell, round(improvements[cell].item(), 4),
+                    early_stopping_patience - wait_epochs)
                 )
+
+                if self.device.startswith('cuda'):
+                    self.memory_stats[cell].append(torch.cuda.memory_stats())
+                torch.cuda.empty_cache()
+
+            # save model
+            if save:
+                if (epoch % save_every) == 0:
+                    self.epochs = epoch
+                    if self.device.startswith('cuda'):
+                        end.record()
+                        torch.cuda.synchronize()
+                        self.runtime = start.elapsed_time(end)
+                    else:
+                        self.runtime = start_time - time.time()
+
+                    self.save_model(
+                        path=os.path.join(save_dir, 'epoch_{}/'.format(epoch))
+                    )
 
             # early stopping
-            if (loss[-1] <= (min_loss[self.m_inds[-1]] - delta)) & (epoch > 10):
-                min_loss[self.m_inds[-1]] = loss[-1]
+            if (improvements >= min_improvement).any() & (epoch > 10):
                 wait_epochs = 0
+                self.min_losses -= improvements.clamp(min_improvement)
+            
             else:
                 wait_epochs += 1
-            
-            if wait_epochs > patience:
+
+            if wait_epochs > early_stopping_patience:
+                self.epochs = epoch
+                if self.device.startswith('cuda'):
+                    end.record()
+                    torch.cuda.synchronize()
+                    self.runtime = start.elapsed_time(end)
+                else:
+                    self.runtime = start_time - time.time()
+                if save:
+                    self.save_model(path=os.path.join(save_dir, 'final/'))
                 break
 
-            # save
-            if save_every != None:
-                if epoch % save_every == 0:
-                    gp_state_dicts = []
-                    for m in range(self.M):
-                        gp_state_dicts.append(self.gp_list[m].state_dict())
-                        
-                    results = {
-                        'pyro_params' : dict(pyro.get_param_store()),
-                        'state_dict' : self.state_dict(),
-                        'gp_state_dicts' : gp_state_dicts,
-                        'loss' : loss,
-                        'init_loss' : init_loss,
-                        'p' : self.p,
-                    }
-
-                    torch.save(results, os.path.join(
-                        save_dir, 'results_%s_epochs.pkl' %epoch)
-                    )
-
-        if self.device.startswith('cuda'):
-            end.record()
-            torch.cuda.synchronize()
-            runtime = start.elapsed_time(end)
-        else:
-            stop_time = time.time()
-            runtime = stop_time - start_time
-
-        gp_state_dicts = []
-        for m in range(self.M):
-            gp_state_dicts.append(self.gp_list[m].state_dict())
+    def get_factors(
+        self,
+        n_samples: int=25,
+        ) -> torch.tensor:
+        """Get the inferred means of the factors.
         
-        results = {
-            'pyro_params' : dict(pyro.get_param_store()),
-            'state_dict' : self.state_dict(),
-            'gp_state_dicts' : gp_state_dicts,
-            'loss' : loss,
-            'init_loss' : init_loss,
-            'p' : self.p,
-            'runtime' : runtime,
-        }
+        Args:
+            n_samples: number of samples to use for mean estimate
 
-        return results
+        Returns:
+            tensor of shape (n_cells, n_factors, res, res)
+        """
+        self.eval()
+        
+        factor_means = []
+        with torch.no_grad():
+            for cell_id in range(self.n_cells):
+                dist = self.factor_list[cell_id](self.grid)
+                samples = dist(torch.Size([n_samples])).cpu()
+                mean = samples.mean(dim=0).view(
+                    self.n_factors, self.grid_res, self.grid_res)
+                mean = torch.transpose(mean, -1, -2)
+                mask = self.masks[cell_id].cpu().to(dtype=torch.float32)
+                mask[mask < 0.5] = np.nan
+                mean *= mask.T
+                factor_means.append(torch.transpose(mean, -1, -2))
+
+        factor_means = torch.stack(factor_means, dim=0)
+        factor_means = torch.nn.Softplus()(factor_means)
+
+        self.train()
+
+        return factor_means
+
+    def get_weights(
+        self,
+        ) -> torch.tensor:
+        """Get the inferred means of the weights.
+        
+        Returns:
+            inferred weights with shape (n_genes, n_factors)
+        """
+        q_loc = pyro.param('q_loc').detach().cpu().squeeze()
+
+        return torch.nn.Softplus()(q_loc)
+
+    def save_model(
+        self,
+        path: str,
+        ) -> dict:
+        """Save the model.
+
+        Args:
+            path: directory where everything is saved
+        """
+        if not os.path.isdir(path):
+            os.makedirs(path)
+
+        # factors
+        for cell in range(self.n_cells):
+            torch.save(
+                obj=self.factor_list[cell].state_dict(),
+                f=os.path.join(path, 'factors_{}.pt'.format(cell)),
+                )
+            
+        # Pyro parameters
+        pyro.get_param_store().save(os.path.join(path, 'pyro_params.save'))
+
+        # model configuration
+        config = {
+            'n_factors' : self.n_factors,
+            'device' : self.device,
+            'n_inducing' : self.n_inducing,
+            'grid_res' : self.grid_res,
+            'factor_smoothness' : self.factor_smoothness,
+            'masks_threshold' : self.masks_threshold,
+            'init_bin_res' : self.init_bin_res,
+        }
+        json.dump(
+            obj=config,
+            fp=open(os.path.join(path, 'config.json'), 'w')
+        )
+
+        # latents
+        latents = {
+            'w' : self.get_weights(),
+            'z' : self.get_factors(),
+        }
+        pickle.dump(
+            obj=latents,
+            file=open(os.path.join(path, 'latents.pkl'), 'wb')
+        )
+
+        # other things
+        other = {
+            'genes' : self.genes,
+            'cells' : self.cells,
+            'n_cells' : self.n_cells,
+            'n_genes' : self.n_genes,
+            'grid' : self.grid.cpu(),
+            'masks' : self.masks.cpu(),
+            'w_init' : self.w_init.cpu(),
+            'q_init' : self.q_init.cpu(),
+            'init_losses' : self.init_losses,
+            'min_losses' : self.min_losses,
+            'losses' : self.losses,
+            'memory_stats' : self.memory_stats,
+            'runtime' : self.runtime,
+        }
+        pickle.dump(
+            obj=other,
+            file=open(os.path.join(path, 'other.pkl'), 'wb')
+        )

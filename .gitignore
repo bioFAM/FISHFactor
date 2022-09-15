@@ -1,4 +1,11 @@
-**/.ipynb_checkpoints/
-*.pkl
-**/__pycache__
-*.feather
+*
+
+!.gitignore
+!*.py
+!*.ipynb
+!*.md
+!model.png
+!*/
+
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*

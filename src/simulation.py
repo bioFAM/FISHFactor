@@ -1,123 +1,136 @@
-from typing import Sequence
-import os
 import torch
-import imageio
-from scipy.ndimage import gaussian_filter
+import pandas as pd
+import gpytorch
+from src import utils
 
 
-def simulate_pp(
-    n_features: int,
-    factor_dir: str,
-    weight_scales_raw: Sequence[float],
-    weight_sparsities: Sequence[float],
-    sigma: float=2.,
-    intensity_scale: float=100.,
+def simulate_data(
+    n_genes: int,
+    n_factors: int,
+    masks: torch.tensor,
+    intensity_scales: torch.tensor,
+    factor_lengthscales: torch.tensor,
+    weight_sparsity: float=0.7,
+    factor_sparsity: float=1.,
+    factor_smoothness: float=1.5,
     ) -> dict:
-    """Simulate a dataset from given factors with random non-negative weights
-        and a Poisson process likelihood.
+    """Simulation of single-molecule resolved subcellular gene expression.
+    
+    Args:
+        n_genes: number of genes
+        n_factors: number of latent factors
+        masks: binary cell masks, shape (n_cells, res, res)
+        intensity_scales: intensity scale factor, shape (n_cells, n_genes)
+        factor_lengthscales: lengthscales of factor GP prior kernel, shape
+            (n_cells, n_factors)
+        weight_sparsity: probability for weight matrix entries to be non-zero
+        factor_sparsity: probability for factors to be non-zero
+        factor_smoothness: smoothness parameter of matern kernel (0.5, 1.5, 2.5)
 
-    :param n_features: number of features
-    :param factor_dir: directory where factor .png files are stored
-    :param weight_scales_raw: weight scale parameters per factor
-        (before exponentiation)
-    :param weight_sparsities: weight sparsity Bernoulli parameters per factor
-    :param sigma: smoothing parameter in gaussian filter applied to factors
-    :param intensity_scale: multiplicative factor of Poisson process intensity
+    Returns:
+        dictionary with simulated data
     """
-    weight_scales_raw = torch.tensor(weight_scales_raw).view(1, -1)
-    weight_sparsities = torch.tensor(weight_sparsities).view(1, -1)
-    n_latents = len(os.listdir(factor_dir))
+    assert intensity_scales.shape[0] == masks.shape[0]
+    assert intensity_scales.shape[1] == n_genes
 
-    # factors
-    z = []
-    for k in range(n_latents):
-        image = imageio.imread(
-            os.path.join(factor_dir, os.listdir(factor_dir)[k])
-        )
-        image = gaussian_filter(image / 255, sigma)
-        image = (image - image.min()) / (image.max() - image.min())
-        z.append(torch.tensor(image, dtype=torch.float32))
-    z = torch.stack(z, dim=0)
-
-    res = z.shape[1]
-
-    # sparsity
-    s = torch.distributions.Bernoulli(
-        probs=weight_sparsities.repeat(n_features, 1)
-    ).sample()
+    n_cells = masks.shape[0]
 
     # weights
-    w = torch.distributions.Normal(
-        loc=torch.zeros([n_features, n_latents]),
-        scale=weight_scales_raw.repeat(n_features, 1),
-    ).sample().exp()
+    while True:
+        s_weights = torch.distributions.Bernoulli(
+            torch.full([n_genes, n_factors], weight_sparsity)
+        ).sample().unsqueeze(0).repeat(n_cells, 1, 1)
+        if (s_weights.sum(dim=2) > 0).all(): # >= one factor active in every gene
+            break
 
-    w *= s
+    q = torch.distributions.Normal(
+        loc=torch.zeros([n_genes, n_factors]),
+        scale=torch.full([n_genes, n_factors], 1.),
+    ).sample().unsqueeze(0).repeat(n_cells, 1, 1)
 
-    # avoid having too little intensity for one feature (otherwise requirement
-    # in thinning that there is at least 1 point per feature could result in an
-    # infinite loop)
-    for d in range(n_features):
-        while w[d].sum() < 0.5:
-            w[d] = torch.distributions.Normal(
-                loc=torch.zeros([n_latents]),
-                scale=weight_scales_raw,
-            ).sample().exp()
+    w = torch.nn.Softplus()(q)
+    w *= s_weights
+    w = w / w.sum(dim=2, keepdim=True)
+
+    # factors
+    res = masks.shape[1]
+    grid = utils.grid(res)
+    
+    mean = gpytorch.means.ZeroMean(batch_shape=[n_cells, n_factors])
+    kernel = gpytorch.kernels.MaternKernel(
+        nu=factor_smoothness,
+        batch_shape=[n_cells, n_factors]
+        )
+    kernel.lengthscale = factor_lengthscales
+    dist = gpytorch.distributions.MultivariateNormal(mean(grid), kernel(grid))
+
+    f = dist.sample().view(n_cells, n_factors, res, res)
+    z = torch.nn.Softplus()(f)
+    z *= masks.unsqueeze(1)
+    z /= z.flatten(start_dim=2).max(dim=2)[0].view(n_cells, n_factors, 1, 1)
+
+    s_factors = torch.distributions.Bernoulli(
+        torch.full([n_cells, n_factors], factor_sparsity)
+        ).sample().view(n_cells, n_factors, 1, 1)
+    z *= s_factors
 
     # Poisson process intensity
-    intensity = torch.matmul(w, z.view(n_latents, -1))
-    intensity *= intensity_scale
-
-    z = z.view(n_latents, res, res)
-    intensity = intensity.view(n_features, res, res)
+    intensity = torch.matmul(w, z.view(n_cells, n_factors, -1))
+    intensity *= intensity_scales.view(n_cells, n_genes, 1)
+    intensity = intensity.view(n_cells, n_genes, res, res)
 
     # simulation by thinning
-    data = [] 
-    for d in range(n_features):
-        while True:
+    coordinates = []
+    for cell in range(n_cells):
+        for gene in range(n_genes):
             # homogeneous Poisson process
-            max_intensity = intensity[d].max()
-            num_points = int(torch.poisson(max_intensity).item())
-            points_x = torch.rand([num_points])
-            points_y = torch.rand([num_points])
+            max_intensity = intensity[cell][gene].max()
+            num_coordinates = max(int(torch.poisson(max_intensity).item()), 1)
+
+            coordinates_x = torch.rand([num_coordinates])
+            coordinates_y = torch.rand([num_coordinates])
 
             # thinning
-            thinning_probs = (1 - intensity[d] / max_intensity)
-            thinning_probs_per_point = thinning_probs[
-                (points_y * res).long(),
-                (points_x * res).long()
-            ]
-            rand_probs = torch.rand_like(thinning_probs_per_point)
-            keep_points = rand_probs >= thinning_probs_per_point
+            thinning_probs = (1 - intensity[cell][gene] / max_intensity)
+            thinning_probs_per_molecule = thinning_probs[
+                (coordinates_y * res).long(),
+                (coordinates_x * res).long()
+                ]
+            rand_probs = torch.rand_like(thinning_probs_per_molecule)
+            keep_coordinates = rand_probs >= thinning_probs_per_molecule
 
-            feature_data = torch.cat(
-                tensors=[
-                    points_x[keep_points].view(-1, 1),
-                    points_y[keep_points].view(-1, 1),
-                    torch.full_like(points_x[keep_points], d).view(-1, 1),
-                ],
-                dim=1,
-            )
+            if keep_coordinates.sum() < 1:
+                ind = torch.randint(high=keep_coordinates.shape[0], size=[1])
+                keep_coordinates[ind] = True
 
-            # accept feature data if at least one point was generated
-            if keep_points.sum() >= 1:
-                break
-    
-        data.append(feature_data)
-    data = torch.cat(data, dim=0) 
+            cell_gene_coordinates = pd.DataFrame({
+                'x' : coordinates_x[keep_coordinates],
+                'y' : coordinates_y[keep_coordinates],
+                'gene' : torch.full_like(coordinates_x[keep_coordinates], gene),
+                'cell' : torch.full_like(coordinates_x[keep_coordinates], cell),
+            })
+        
+            coordinates.append(cell_gene_coordinates)
+    coordinates = pd.concat(coordinates, axis=0)
 
     return {
-        'n_features' : n_features,
-        'factor_dir' : factor_dir,
-        'n_latents' : n_latents,
-        'weight_scales_raw' : weight_scales_raw,
-        'weight_sparsities' : weight_sparsities,
-        'sigma' : sigma,
-        'intensity_scale' : intensity_scale,
-        'z' : z,
-        's' : s,
+        'n_genes' : n_genes,
+        'n_factors' : n_factors,
+        'n_cells' : n_cells,
+        'masks' : masks,
+        'intensity_scales' : intensity_scales,
+        'factor_lengthscales' : factor_lengthscales,
+        'weight_sparsity' : weight_sparsity,
+        'factor_sparsity' : factor_sparsity,
+        'factor_smoothness' : factor_smoothness,
+        's_weights' : s_weights,
+        's_factors' : s_factors,
+        'q' : q,
         'w' : w,
-        'intensity' : intensity,
-        'data' : data,
         'res' : res,
+        'grid' : grid,
+        'f' : f,
+        'z' : z,
+        'intensity' : intensity,
+        'coordinates' : coordinates,
         }
