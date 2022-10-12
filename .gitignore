@@ -6,6 +6,7 @@
 !*.md
 !model.png
 !*/
+!environment.yml
 
 .ipynb_checkpoints
 */.ipynb_checkpoints/*
