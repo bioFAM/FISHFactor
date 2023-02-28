@@ -1,39 +1,45 @@
-# requires https://github.com/willtownes/nsf-paper.git in a subdirectory nsf_paper/
-# and the required packages, e.g. anndata, tensorflow, tensorflow_probability
+import git
 import os
 import sys
-from anndata import AnnData
-import pickle
-from tensorflow_probability import math as tm
 import numpy as np
-import tensorflow as tf
+import pickle
 import random
 import torch
-tfk = tm.psd_kernels
+from anndata import AnnData
+import tensorflow as tf
+from tensorflow_probability import math as tm
+from src import utils
 
-sys.path.insert(1, os.path.join(sys.path[0], 'nsf_paper/'))
+# download code from NSF paper (Townes et al., 2021)
+if not os.path.isdir('nsf-paper/'):
+    repo = git.Repo.clone_from(
+        url='https://github.com/willtownes/nsf-paper',
+        to_path='nsf-paper/',
+        branch='main',
+        no_checkout=True
+        )
+
+    repo.git.checkout('928b36c54cb19fae1fa3e86748e2a6846f40210a')
+
+sys.path.insert(1, os.path.join(sys.path[0], 'nsf-paper/'))
 from models import sf
 from utils import preprocess, misc, training, postprocess
 
-sys.path.insert(1, os.path.join(sys.path[0], '..'))
-from src.utils import binning
-
-for intensity_scale in [50, 100, 200, 300]:
+for intensity_scale in [50, 100, 200, 300, 400]:
     for cell in range(20):
-        data = torch.load('data/intensity_scale_{}/cell_{}.pkl'
+        data = torch.load('../../data/simulated/data/independent/{}_{}.pt'
             .format(intensity_scale, cell))
+        coords = data['coordinates'].sort_values(['cell', 'gene'])
+        gene_names = coords.gene.unique()
 
-        for resolution in [2, 5, 10, 20, 30, 40, 50]:
-            random.seed(1234)
-            np.random.seed(1234)
-            tf.random.set_seed(1234)
-
+        for resolution in [5, 10, 20, 30, 40]:
             binned_cell_data = torch.zeros(
-                [data['n_genes'], resolution, resolution]
-                )
-            for gene in range(data['n_genes']):
-                gene_data = data['coordinates'].query('gene=={}'.format(gene))
-                binned_cell_data[gene] = binning(
+                [data['n_genes'], resolution, resolution])
+
+            for i, gene in enumerate(gene_names):
+                gene_data = coords.query("gene=='{}'".format(gene))
+
+                binned_cell_data[i] = utils.binning(
                     torch.tensor(gene_data.x.values),
                     torch.tensor(gene_data.y.values),
                     xlim=[0, 1],
@@ -43,6 +49,11 @@ for intensity_scale in [50, 100, 200, 300]:
             binned_cell_data = binned_cell_data.view(data['n_genes'], -1).T
             binned_cell_data = binned_cell_data.numpy()
 
+            torch.manual_seed(1234)
+            random.seed(1234)
+            np.random.seed(1234)
+            tf.random.set_seed(1234)
+
             grid = misc.make_grid(binned_cell_data.shape[0])
             grid[:,1] = -grid[:,1]
             grid = preprocess.rescale_spatial_coords(grid)
@@ -51,11 +62,11 @@ for intensity_scale in [50, 100, 200, 300]:
                 X=binned_cell_data,
                 obsm={"spatial" : grid},
             )
+
             ad.layers = {"counts" : ad.X.copy()}
 
-            D, D_val = preprocess.anndata_to_train_val(
-                ad, layer="counts", train_frac=1., flip_yaxis=False
-                )
+            D, D_val = preprocess.anndata_to_train_val(ad, layer="counts",
+                train_frac=1., flip_yaxis=False)
 
             n_obs = D['Y'].shape[0]
             n_genes = D['Y'].shape[1]
@@ -66,13 +77,12 @@ for intensity_scale in [50, 100, 200, 300]:
             n_factors = 3
             inducing_points = misc.kmeans_inducing_pts(grid, 500)
             n_inducing_points = inducing_points.shape[0]
-            kernel = tfk.MaternThreeHalves
+            kernel = tm.psd_kernels.MaternThreeHalves
 
             try:
-                model = sf.SpatialFactorization(
-                    n_genes, n_factors, inducing_points, psd_kernel=kernel,
-                    nonneg=True, lik='poi'
-                    )
+                model = sf.SpatialFactorization(n_genes, n_factors, 
+                    inducing_points, psd_kernel=kernel, nonneg=True, lik='poi')
+
                 model.init_loadings(D['Y'], X=grid, shrinkage=0.3)
                 trainer = training.ModelTrainer(model)
                 trainer.train_model(*D_tf, status_freq=50)
@@ -82,13 +92,10 @@ for intensity_scale in [50, 100, 200, 300]:
                     )
 
                 z_inferred_original = model_interpret['factors'].T.reshape(
-                    [n_factors, resolution, resolution]
-                    )
+                    [n_factors, resolution, resolution])
                 z_inferred_original = torch.tensor(z_inferred_original)
                 z_inferred = torch.nn.functional.interpolate(
-                    z_inferred_original.unsqueeze(0),
-                    [50, 50],
-                    ).squeeze(0)
+                    z_inferred_original.unsqueeze(0), [50, 50]).squeeze(0)
 
                 w_inferred = model_interpret['loadings']
 
@@ -98,11 +105,12 @@ for intensity_scale in [50, 100, 200, 300]:
                     'w' : w_inferred,
                 }
 
-                os.makedirs('results/nsf/intensity_scale_{}/cell_{}'
+                os.makedirs('results/nsf/{}_{}/'
                     .format(intensity_scale, cell), exist_ok=True)
+                    
                 pickle.dump(
                     results,
-                    open('results/nsf/intensity_scale_{}/cell_{}/resolution_{}.pkl'
+                    open('results/nsf/{}_{}/{}.pkl'
                         .format(intensity_scale, cell, resolution), 'wb'))
 
             except:

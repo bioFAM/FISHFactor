@@ -1,32 +1,36 @@
 import requests
 import zipfile
 import io
+import os
 import pandas as pd
 from scipy.io import loadmat
 
-urls = ['https://zenodo.org/record/2669683/files/seqFISH%2B_NIH3T3_point_locations.zip',
-        'https://zenodo.org/record/2669683/files/ROIs_Experiment1_NIH3T3.zip',
-        'https://zenodo.org/record/2669683/files/ROIs_Experiment2_NIH3T3.zip',
-]
+if not os.path.isdir('raw/'):
+    os.makedirs('raw/')
 
-for i, url in enumerate(urls):
+urls = [
+    'https://zenodo.org/record/2669683/files/seqFISH%2B_NIH3T3_point_locations.zip',
+    'https://zenodo.org/record/2669683/files/ROIs_Experiment1_NIH3T3.zip',
+    'https://zenodo.org/record/2669683/files/ROIs_Experiment2_NIH3T3.zip',
+    ]
+
+for url in urls:
     r = requests.get(url)
     z = zipfile.ZipFile(io.BytesIO(r.content))
-    z.extractall()
+    z.extractall('raw/')
 
 # load raw data
-locations_exp1 = loadmat('RNA_locations_run_1.mat')['tot']
-locations_exp2 = loadmat('RNA_locations_run_2.mat')['tot']
+locations_exp1 = loadmat('raw/RNA_locations_run_1.mat')['tot']
+locations_exp2 = loadmat('raw/RNA_locations_run_2.mat')['tot']
 locations = [locations_exp1, locations_exp2]
-gene_names = loadmat('all_gene_Names.mat')['allNames'][:, 0]
+gene_names = loadmat('raw/all_gene_Names.mat')['allNames'][:, 0]
 
 # put everything in one large dataframe
 data = []
 for experiment in range(len(locations)):
     for fov in range(locations[experiment].shape[0]):
         for cell in range(locations[experiment].shape[1]):
-            print('Experiment %s, FOV %s, Cell %s' %(experiment, fov, cell))
-            for gene in range(locations[experiment].shape[2]):
+            for gene in range(100):#locations[experiment].shape[2]):
                 # check if points exist
                 if locations[experiment][fov, cell, gene].shape[1] != 3:
                     continue

@@ -5,6 +5,7 @@ from scipy.stats import gaussian_kde, pearsonr
 from scipy.optimize import linear_sum_assignment
 from sklearn.decomposition import NMF
 from typing import Tuple, Union
+import matplotlib as plt
 
 def rescale_cells(
     data: pd.DataFrame,
@@ -92,7 +93,7 @@ def initialize_weights(
     """Initialize the weight matrix using NMF on binned data.
     
     Args:
-        data: must contain 'x', 'y', 'gene id', 'cell_id' columns
+        data: must contain 'x', 'y', 'gene_id', 'cell_id' columns
         n_factors: number of latent factors
         bin_res: number of bins per spatial dimension
 
@@ -101,8 +102,8 @@ def initialize_weights(
     """
     xlim = [data.x.min(), data.x.max()]
     ylim = [data.y.min(), data.y.max()]
-    n_cells = data.cell_id.unique().shape[0]
-    n_genes = data.gene_id.unique().shape[0]
+    n_cells = data.cell_id.unique().size
+    n_genes = data.gene_id.unique().size
     binned_data = []
 
     for cell_id in range(n_cells):
@@ -151,7 +152,7 @@ def average_intensity(
     if per_gene:
         if per_cell:
             n_molecules = data.groupby(['gene_id', 'cell_id']).size().reset_index()
-            table = n_molecules.pivot('gene_id', 'cell_id', 0).fillna(0).values
+            table = n_molecules.pivot(index='gene_id', columns='cell_id', values=0).fillna(0).values
             avg_intensity = torch.tensor(table) / area.view(1, n_cells)
         else:
             n_molecules = data.groupby(['gene_id']).size() / n_cells
@@ -233,3 +234,29 @@ def binning(
     )
 
     return binned_data
+
+def plot_style():
+    MEDIUM_SIZE = 8
+    BIGGER_SIZE = 10
+
+    plt.style.use('default')
+    plt.rcParams['mathtext.fontset'] = 'stix'
+    plt.rcParams['font.family'] = 'STIXGeneral'
+    plt.rcParams['font.size'] = MEDIUM_SIZE
+    plt.rcParams['axes.labelsize'] = MEDIUM_SIZE
+    plt.rcParams['legend.fontsize'] = MEDIUM_SIZE
+    plt.rcParams['axes.titlesize'] = MEDIUM_SIZE
+    plt.rcParams['xtick.direction'] = 'out'
+    plt.rcParams['ytick.direction'] = 'out'
+    plt.rcParams['xtick.major.size'] = 2
+    plt.rcParams['xtick.minor.size'] = 1
+    plt.rcParams['ytick.major.size'] = 2
+    plt.rcParams['ytick.minor.size'] = 1
+    plt.rcParams['xtick.major.width'] = 0.5
+    plt.rcParams['xtick.minor.width'] = 0.5
+    plt.rcParams['ytick.major.width'] = 0.5
+    plt.rcParams['ytick.minor.width'] = 0.5
+    plt.rcParams['axes.linewidth'] = 0.8
+    plt.rcParams['legend.handlelength'] = 2
+    plt.rcParams['figure.titlesize'] = MEDIUM_SIZE
+    plt.rcParams['figure.dpi'] = 300

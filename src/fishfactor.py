@@ -26,10 +26,13 @@ class FISHFactor(gpytorch.Module):
         
         Args:
             data: DataFrame with 'x', 'y', 'cell', 'gene' columns
-            n_factors: number of spatial factors per cell
+                the gene column should have data type str and the cell column
+                data type float or int
+            n_factors: number of latent spatial factors per cell
             device: 'cpu' or 'cuda:x'
-            n_inducing: number of GP inducing points per spatial factor
+            n_inducing: number of GP inducing points per latent spatial factor
             grid_res: grid resolution, for cell masks and integral quadrature
+                in the likelihood term
             factor_smoothness: smoothness parameter of Matérn kernel
                 (0.5, 1.5, or 2.5)
             masks_threshold: KDE threshold for cell masks
@@ -46,62 +49,64 @@ class FISHFactor(gpytorch.Module):
         self.factor_smoothness = factor_smoothness
         self.masks_threshold = masks_threshold
         self.init_bin_res = init_bin_res
+        self.to(device=device)
 
-        self.to(device=self.device)
+        # sort data
+        self.data = self.data.sort_values(['cell', 'gene'])
 
         # indexing of genes
-        self.data['gene_id'], self.genes = pd.factorize(data['gene'])
+        self.data['gene_id'], self.genes = pd.factorize(self.data['gene'])
         self.n_genes = len(self.genes)
 
         # indexing of cells
-        data['cell_id'], self.cells = pd.factorize(data['cell'])
+        self.data['cell_id'], self.cells = pd.factorize(self.data['cell'])
         self.n_cells = len(self.cells)
-        
-        # coordinate rescaling of every cell to the unit square
+
+        # coordinate rescaling of individual cells to the unit square
         self.data = utils.rescale_cells(self.data)
 
-        self.data = self.data.sort_values(by='gene_id')
-
         # grid coordinates in unit square
-        self.grid = utils.grid(self.grid_res).to(device=self.device)
+        self.grid = utils.grid(grid_res).to(device=device)
 
         # cell masks based on KDE threshold
         self.masks = utils.cell_masks(
             data=self.data,
             grid=self.grid.cpu(),
-            threshold=self.masks_threshold,
-            ).to(device=self.device)
+            threshold=masks_threshold,
+            ).to(device=device)
 
         # initialization of weights with binning based NMF
         self.w_init = utils.initialize_weights(
             data=self.data,
-            n_factors=self.n_factors,
-            bin_res=self.init_bin_res,
-            ).to(device=self.device).detach()
+            n_factors=n_factors,
+            bin_res=init_bin_res,
+            ).to(device=device).detach()
         self.q_init = (self.w_init.exp() - 1).log().clamp(min=-10)
 
+        # determination of scaling factor in likelihood term
         self.scaling = utils.average_intensity(
             data=self.data,
             masks=self.masks.cpu(),
             per_gene=True,
             per_cell=True,
-        ).to(device=self.device)
+        ).to(device=device)
 
         # instantiate spatial factors
         self.factor_list = []
+        self.inducing_points = []
         for cell_id in range(self.n_cells):
             # sample initial inducing point locations from molecule locations
             cell_data = self.data[self.data.cell_id==cell_id]
-            inducing_points = cell_data.sample(
+            self.inducing_points.append(cell_data.sample(
                 n=min(n_inducing, len(cell_data))
-                )
+                ))
 
             self.factor_list.append(gp.SpatialFactors(
-                inducing_points=inducing_points,
+                inducing_points=self.inducing_points[-1],
                 n_factors=n_factors,
                 smoothness=factor_smoothness,
                 scale_param=self.n_cells > 1,
-            ).to(device=self.device))
+            ).to(device=device))
 
     def model(
         self,
@@ -159,7 +164,6 @@ class FISHFactor(gpytorch.Module):
             split_size=[data.shape[0], cell_grid.shape[0]],
             dim=-1,
         )
-
 
         # Poisson point process likelihood
         expectation = (
@@ -298,7 +302,6 @@ class FISHFactor(gpytorch.Module):
         
             for cell in range(self.n_cells):
                 cell_data = data_tensor[data_tensor[:, 3]==cell]
-
                 with pyro.poutine.scale(scale=1./abs(self.init_losses[cell])):
                     self.zero_grad()
                     loss = svi.step(cell_data[:, :3], cell)
@@ -334,7 +337,7 @@ class FISHFactor(gpytorch.Module):
             if (improvements >= min_improvement).any() & (epoch > 10):
                 wait_epochs = 0
                 self.min_losses -= improvements.clamp(min_improvement)
-            
+
             else:
                 wait_epochs += 1
 
