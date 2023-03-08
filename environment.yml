@@ -278,7 +278,3 @@ dependencies:
       - wheel==0.38.4
       - widgetsnbextension==4.0.3
       - zipp==3.11.0
-<<<<<<< HEAD
-prefix: /data/florin/miniconda3/envs/FISHFactor
-=======
->>>>>>> testing
