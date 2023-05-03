@@ -7,6 +7,7 @@ from sklearn.decomposition import NMF
 from typing import Tuple, Union
 import matplotlib as plt
 
+
 def rescale_cells(
     data: pd.DataFrame,
     ) -> pd.DataFrame:
